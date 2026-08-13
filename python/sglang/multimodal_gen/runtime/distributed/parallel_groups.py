@@ -4,6 +4,16 @@
 import torch
 
 
+def _new_sp_group(ranks: list[int], nccl_high_priority: bool):
+    """Create an SP subgroup, optionally backed by a high-priority NCCL stream."""
+    kwargs = {}
+    if nccl_high_priority and torch.distributed.get_backend() == "nccl":
+        options = torch.distributed.ProcessGroupNCCL.Options()
+        options.is_high_priority_stream = True
+        kwargs["pg_options"] = options
+    return torch.distributed.new_group(ranks, **kwargs)
+
+
 class Singleton:
     _instance = None
 
@@ -28,6 +38,7 @@ def set_seq_parallel_pg_by_sp_groups(
     rank: int,
     sp_groups: list[list[int]],
     use_ulysses_low: bool = True,
+    nccl_high_priority: bool = False,
 ):
     """Create Ulysses/Ring process groups inside each SP group.
 
@@ -40,6 +51,7 @@ def set_seq_parallel_pg_by_sp_groups(
         rank: global rank of current process.
         sp_groups: list of global-rank lists for each SP group.
         use_ulysses_low: keep the same semantics as the original function.
+        nccl_high_priority: use a high-priority CUDA stream for NCCL subgroups.
     """
     sp_degree = sp_ring_degree * sp_ulysses_degree
     assert sp_degree > 0
@@ -62,28 +74,28 @@ def set_seq_parallel_pg_by_sp_groups(
             for i in range(num_ulysses_pgs):
                 idx = list(range(i * sp_ulysses_degree, (i + 1) * sp_ulysses_degree))
                 ulysses_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ulysses_ranks)
+                group = _new_sp_group(ulysses_ranks, nccl_high_priority)
                 if rank in ulysses_ranks:
                     ulyssess_pg = group
 
             for i in range(num_ring_pgs):
                 idx = list(range(i, sp_degree, num_ring_pgs))
                 ring_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ring_ranks)
+                group = _new_sp_group(ring_ranks, nccl_high_priority)
                 if rank in ring_ranks:
                     ring_pg = group
         else:
             for i in range(num_ring_pgs):
                 idx = list(range(i * sp_ring_degree, (i + 1) * sp_ring_degree))
                 ring_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ring_ranks)
+                group = _new_sp_group(ring_ranks, nccl_high_priority)
                 if rank in ring_ranks:
                     ring_pg = group
 
             for i in range(num_ulysses_pgs):
                 idx = list(range(i, sp_degree, num_ulysses_pgs))
                 ulysses_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ulysses_ranks)
+                group = _new_sp_group(ulysses_ranks, nccl_high_priority)
                 if rank in ulysses_ranks:
                     ulyssess_pg = group
 

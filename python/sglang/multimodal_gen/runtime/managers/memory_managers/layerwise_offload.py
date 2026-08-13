@@ -1,10 +1,16 @@
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.cooperative_prefetch import (
+    CooperativeCopyHandle,
+    format_prefetch_batch_nvtx_name,
+    get_cooperative_prefetch_scheduler,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -14,6 +20,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 
 logger = init_logger(__name__)
 
@@ -43,12 +50,34 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
         prefetch_size: int = 1,
         resident_layers: int = 0,
+        prefetch_chunk_size: int = 0,
+        cooperative_prefetch: bool = False,
+        prefetch_queue_depth: int = 4,
+        enable_prefetch_nvtx: bool = False,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
+        self.prefetch_chunk_size = int(prefetch_chunk_size)
+        if self.prefetch_chunk_size < 0:
+            raise ValueError("prefetch_chunk_size must be non-negative")
+        self.cooperative_prefetch = bool(cooperative_prefetch)
+        self.prefetch_queue_depth = int(prefetch_queue_depth)
+        self.enable_prefetch_nvtx = bool(enable_prefetch_nvtx)
+        if self.cooperative_prefetch and self.prefetch_chunk_size == 0:
+            raise ValueError(
+                "cooperative prefetch requires a positive prefetch_chunk_size"
+            )
+        if self.cooperative_prefetch and self.prefetch_chunk_size < 1024**2:
+            raise ValueError(
+                "cooperative prefetch requires prefetch_chunk_size >= 1048576"
+            )
+        if self.cooperative_prefetch and not self.pin_cpu_memory:
+            raise ValueError("cooperative prefetch requires pinned CPU memory")
+        if self.prefetch_queue_depth < 1:
+            raise ValueError("prefetch_queue_depth must be at least 1")
         # Leading layers held on GPU across denoise steps, instead of being
         # re-streamed every step like the tail.
         self.resident_layers = min(max(0, int(resident_layers)), self.num_layers)
@@ -65,7 +94,23 @@ class LayerwiseOffloadManager:
         self.device = torch.device(
             current_platform.device_type, torch.get_device_module().current_device()
         )
-        self.copy_stream = torch.get_device_module().Stream()
+        # CUDA stream priority 0 is the low/default priority. Chunking gives a
+        # high-priority NCCL stream opportunities to run between H2D descriptors.
+        # Keep the old stream construction exactly as-is when chunking is off.
+        self._cooperative_scheduler = None
+        if self.cooperative_prefetch:
+            if self.device.type != "cuda":
+                raise RuntimeError("Cooperative layer prefetch currently requires CUDA")
+            self._cooperative_scheduler = get_cooperative_prefetch_scheduler(
+                self.device.index, self.prefetch_queue_depth
+            )
+            self.copy_stream = self._cooperative_scheduler.stream
+        else:
+            self.copy_stream = (
+                torch.get_device_module().Stream(priority=0)
+                if self.prefetch_chunk_size
+                else torch.get_device_module().Stream()
+            )
 
         self._layer_name_re = re.compile(
             rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
@@ -84,6 +129,7 @@ class LayerwiseOffloadManager:
         self._gpu_layers: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        self._prefetch_handles: Dict[int, CooperativeCopyHandle] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -144,6 +190,102 @@ class LayerwiseOffloadManager:
         if remainder == 0:
             return offset
         return offset + alignment_numel - remainder
+
+    @staticmethod
+    def _copy_ranges(
+        numel: int, element_size: int, chunk_size_bytes: int
+    ) -> Iterator[Tuple[int, int]]:
+        """Return element ranges for bounded H2D copy descriptors."""
+        if chunk_size_bytes <= 0:
+            yield 0, numel
+            return
+        chunk_numel = max(1, chunk_size_bytes // element_size)
+        for start in range(0, numel, chunk_numel):
+            yield start, min(start + chunk_numel, numel)
+
+    def _copy_to_device(
+        self,
+        destination: torch.Tensor,
+        source: torch.Tensor,
+        *,
+        non_blocking: bool,
+    ) -> None:
+        if not self.prefetch_chunk_size:
+            destination.copy_(source, non_blocking=non_blocking)
+            return
+
+        # Both tensors are manager-owned allocations with storage_offset=0 and
+        # matching layouts. Copying their storage-linear views also handles
+        # stride-preserving FP8 weights without materializing a contiguous CPU
+        # duplicate.
+        source_storage_numel = (
+            source.untyped_storage().nbytes() // source.element_size()
+        )
+        destination_storage_numel = (
+            destination.untyped_storage().nbytes() // destination.element_size()
+        )
+        if source_storage_numel != destination_storage_numel:
+            raise RuntimeError(
+                "Layerwise offload source and destination storage sizes differ: "
+                f"{source_storage_numel} != {destination_storage_numel}"
+            )
+        source_storage = source.as_strided(
+            (source_storage_numel,), (1,), storage_offset=0
+        )
+        destination_storage = destination.as_strided(
+            (destination_storage_numel,), (1,), storage_offset=0
+        )
+        for start, end in self._copy_ranges(
+            source_storage_numel,
+            source.element_size(),
+            self.prefetch_chunk_size,
+        ):
+            destination_storage[start:end].copy_(
+                source_storage[start:end], non_blocking=non_blocking
+            )
+
+    def _copy_batch_to_device(
+        self,
+        pairs: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        layer_idx: int,
+        non_blocking: bool,
+    ) -> None:
+        # Keep the default path free of marker formatting and NVTX calls. Only
+        # chunked prefetch needs a comparison range against cooperative mode.
+        if not self.enable_prefetch_nvtx or not self.prefetch_chunk_size:
+            for destination, source in pairs:
+                self._copy_to_device(
+                    destination,
+                    source,
+                    non_blocking=non_blocking,
+                )
+            return
+
+        marker = format_prefetch_batch_nvtx_name(
+            mode="chunked",
+            layer_idx=layer_idx,
+            chunk_size_bytes=self.prefetch_chunk_size,
+        )
+        with maybe_nvtx_range(marker):
+            for destination, source in pairs:
+                self._copy_to_device(
+                    destination,
+                    source,
+                    non_blocking=non_blocking,
+                )
+
+    def _resolve_prefetch_event(self, layer_idx: int):
+        handle = self._prefetch_handles.get(layer_idx)
+        if handle is None:
+            return self._prefetch_events.get(layer_idx)
+        event = handle.wait_event()
+        self._prefetch_events[layer_idx] = event
+        return event
+
+    def _resolve_all_prefetch_events(self) -> None:
+        for layer_idx in list(self._prefetch_handles):
+            self._resolve_prefetch_event(layer_idx)
 
     @torch.compiler.disable
     def _initialize(self) -> None:
@@ -310,20 +452,27 @@ class LayerwiseOffloadManager:
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+        if not self.cooperative_prefetch:
+            self.copy_stream.wait_stream(torch.get_device_module().current_stream())
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
+        copy_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        stream_context = (
+            nullcontext()
+            if self.cooperative_prefetch
+            else torch.get_device_module().stream(self.copy_stream)
+        )
         with (
             torch.inference_mode(False),
             torch.no_grad(),
-            torch.get_device_module().stream(self.copy_stream),
+            stream_context,
         ):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
                 )
-                gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
+                copy_pairs.append((gpu_buffer, cpu_buffer))
                 gpu_buffers[dtype] = gpu_buffer
 
             # restore model's weights by their metadata using the same copy stream
@@ -342,7 +491,7 @@ class LayerwiseOffloadManager:
                         dtype=meta["dtype"],
                         device=self.device,
                     )
-                    gpu_tensor.copy_(cpu_tensor, non_blocking=non_blocking)
+                    copy_pairs.append((gpu_tensor, cpu_tensor))
                     target.data = self._wrap_for_target(target, gpu_tensor)
                     continue
 
@@ -355,10 +504,29 @@ class LayerwiseOffloadManager:
                 ].view(meta["shape"])
                 target.data = self._wrap_for_target(target, local_tensor)
 
-        # record the prefetch event of this layer after all copies are enqueued
-        event = torch.get_device_module().Event()
-        event.record(self.copy_stream)
-        self._prefetch_events[layer_idx] = event
+            if not self.cooperative_prefetch:
+                self._copy_batch_to_device(
+                    copy_pairs,
+                    layer_idx=layer_idx,
+                    non_blocking=non_blocking,
+                )
+
+        if self.cooperative_prefetch:
+            handle = self._cooperative_scheduler.submit(
+                copy_pairs,
+                self.prefetch_chunk_size,
+                layer_idx=layer_idx,
+                enable_prefetch_nvtx=self.enable_prefetch_nvtx,
+            )
+            self._prefetch_handles[layer_idx] = handle
+            if not non_blocking:
+                event = self._resolve_prefetch_event(layer_idx)
+                torch.get_device_module().current_stream().wait_event(event)
+        else:
+            # record the prefetch event of this layer after all copies are enqueued
+            event = torch.get_device_module().Event()
+            event.record(self.copy_stream)
+            self._prefetch_events[layer_idx] = event
 
         self._gpu_layers.add(layer_idx)
 
@@ -376,8 +544,15 @@ class LayerwiseOffloadManager:
         if not force and layer_idx < self._retained_layers:
             return
 
+        handle = self._prefetch_handles.get(layer_idx)
+        if handle is not None:
+            # A manual/early release must not orphan a background H2D reader:
+            # refit may mutate the pinned CPU source immediately afterwards.
+            self._resolve_prefetch_event(layer_idx).synchronize()
+
         # clear prefetch event, since it's useless and needs to be reset
         self._prefetch_events.pop(layer_idx, None)
+        self._prefetch_handles.pop(layer_idx, None)
 
         if layer_idx not in self._gpu_layers:
             return
@@ -398,6 +573,7 @@ class LayerwiseOffloadManager:
         denoise stage that the resident set is scoped to."""
         if not self.enabled or self.device is None:
             return
+        self._resolve_all_prefetch_events()
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -409,6 +585,7 @@ class LayerwiseOffloadManager:
         """Load all layers from CPU to GPU."""
         if not self.enabled or self.device is None:
             return
+        self._resolve_all_prefetch_events()
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -424,6 +601,7 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._consolidated_cpu_weights:
             return
 
+        self._resolve_prefetch_event(layer_idx)
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -483,6 +661,7 @@ class LayerwiseOffloadManager:
             return None
 
         updated_names: Set[str] = set()
+        synchronized_layers: Set[int] = set()
         for name, loaded_weight in weight_dict.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None:
@@ -490,6 +669,15 @@ class LayerwiseOffloadManager:
             meta_layer = self._weight_metadata.get(layer_idx)
             if meta_layer is None or name not in meta_layer:
                 continue
+
+            if layer_idx not in synchronized_layers:
+                event = self._resolve_prefetch_event(layer_idx)
+                if event is not None:
+                    # The CPU buffer is the live source of a background H2D
+                    # job. A stream wait is insufficient before the CPU writes
+                    # it, so refit must synchronize the layer completion event.
+                    event.synchronize()
+                synchronized_layers.add(layer_idx)
 
             meta = meta_layer[name]
             local_loaded_weight = self._to_local_tensor(loaded_weight)
@@ -517,7 +705,8 @@ class LayerwiseOffloadManager:
             if layer_idx in self._gpu_layers:
                 target = self.get_target_with_name(name)
                 target_local = self._to_local_tensor(target)
-                target_local.copy_(local_loaded_weight.to(dtype=target_local.dtype))
+                with torch.no_grad():
+                    target_local.copy_(local_loaded_weight.to(dtype=target_local.dtype))
 
             updated_names.add(name)
 
@@ -563,6 +752,7 @@ class LayerwiseOffloadManager:
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
+                self._resolve_prefetch_event(i)
                 if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
@@ -643,6 +833,10 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
+                prefetch_chunk_size=server_args.dit_offload_prefetch_chunk_size,
+                cooperative_prefetch=server_args.dit_offload_cooperative_prefetch,
+                prefetch_queue_depth=server_args.dit_offload_prefetch_queue_depth,
+                enable_prefetch_nvtx=server_args.enable_layerwise_nvtx_marker,
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)

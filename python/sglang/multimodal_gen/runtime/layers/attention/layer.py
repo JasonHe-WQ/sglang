@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.cooperative_prefetch import (
+    cooperative_a2a_gate,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -71,6 +74,17 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+
+
+def _usp_input_all_to_all_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep cooperative H2D paused across the consecutive Q/K/V input A2As."""
+    with cooperative_a2a_gate():
+        q = _usp_input_all_to_all(q, head_dim=2)
+        k = _usp_input_all_to_all(k, head_dim=2)
+        v = _usp_input_all_to_all(v, head_dim=2)
+    return q, k, v
 
 
 def build_varlen_mask_meta(
@@ -967,9 +981,7 @@ class USPAttention(nn.Module):
                 k = k.contiguous()
                 v = v.contiguous()
             else:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -1018,9 +1030,7 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_all_to_all_qkv(q_shard, k_shard, v_shard)
 
         # Q and KV can have different head counts (GQA), so slice each replicated
         # prefix by its own per-rank head shard to match the all-to-all'd suffix.

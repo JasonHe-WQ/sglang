@@ -210,6 +210,8 @@ class ServerArgs(DisaggServerArgsMixin):
     gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
+    # Run SP NCCL communicators on CUDA's high-priority stream.
+    sp_nccl_high_priority: bool = False
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
@@ -273,6 +275,11 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    # Maximum bytes per async H2D descriptor. 0 keeps the original whole-buffer copy.
+    dit_offload_prefetch_chunk_size: int = 0
+    # Coordinate bounded layer H2D blocks with USP all-to-all operations.
+    dit_offload_cooperative_prefetch: bool = False
+    dit_offload_prefetch_queue_depth: int = 4
     # If set, keep this many leading DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
     offload_during_compile: bool = True
@@ -1435,6 +1442,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help="The sequence parallelism size. If not specified, will use all remaining GPUs after accounting for TP and DP.",
         )
         parser.add_argument(
+            "--sp-nccl-high-priority",
+            action=StoreBoolean,
+            default=ServerArgs.sp_nccl_high_priority,
+            help=(
+                "Create Ulysses/Ring NCCL process groups with a high-priority CUDA "
+                "stream. This can let SP collectives run ahead of low-priority, "
+                "chunked layer-prefetch copies. Has no effect on non-NCCL backends."
+            ),
+        )
+        parser.add_argument(
             "--ulysses-degree",
             type=int,
             default=ServerArgs.ulysses_degree,
@@ -1670,6 +1687,39 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
+            "--dit-offload-prefetch-chunk-size",
+            type=int,
+            default=ServerArgs.dit_offload_prefetch_chunk_size,
+            help=(
+                "Maximum bytes in each async H2D copy issued by layerwise prefetch. "
+                "0 uses one copy per consolidated buffer (default). Positive values "
+                "enable a low-priority prefetch stream and bounded copy descriptors. "
+                "Cooperative mode requires at least 1048576 bytes; the Wan benchmark "
+                "runner covers 1 and 4 MiB."
+            ),
+        )
+        parser.add_argument(
+            "--dit-offload-cooperative-prefetch",
+            action=StoreBoolean,
+            default=ServerArgs.dit_offload_cooperative_prefetch,
+            help=(
+                "Run chunked layer prefetch through a bounded background H2D queue. "
+                "USP all-to-all operations drain and pause this queue, then resume it "
+                "after the collective completes. Requires pinned CPU memory and a "
+                "positive --dit-offload-prefetch-chunk-size. Disabled by default."
+            ),
+        )
+        parser.add_argument(
+            "--dit-offload-prefetch-queue-depth",
+            type=int,
+            default=ServerArgs.dit_offload_prefetch_queue_depth,
+            help=(
+                "Maximum number of H2D blocks submitted before the cooperative "
+                "prefetch worker fences the copy stream. This bounds A2A gate wait "
+                "time to roughly queue-depth times chunk-size bytes."
+            ),
         )
         parser.add_argument(
             "--dit-layerwise-resident-layers",
@@ -2295,6 +2345,29 @@ class ServerArgs(DisaggServerArgsMixin):
         self.pipeline_config.check_pipeline_config()
 
     def _validate_offload(self):
+        if self.dit_offload_prefetch_chunk_size < 0:
+            raise ValueError("dit_offload_prefetch_chunk_size must be non-negative")
+        if self.dit_offload_prefetch_queue_depth < 1:
+            raise ValueError("dit_offload_prefetch_queue_depth must be at least 1")
+        if (
+            self.dit_offload_cooperative_prefetch
+            and self.dit_offload_prefetch_chunk_size == 0
+        ):
+            raise ValueError(
+                "dit_offload_cooperative_prefetch requires a positive "
+                "dit_offload_prefetch_chunk_size"
+            )
+        if (
+            self.dit_offload_cooperative_prefetch
+            and self.dit_offload_prefetch_chunk_size < 1024**2
+        ):
+            raise ValueError(
+                "dit_offload_cooperative_prefetch requires "
+                "dit_offload_prefetch_chunk_size >= 1048576"
+            )
+        if self.dit_offload_cooperative_prefetch and not self.pin_cpu_memory:
+            raise ValueError("dit_offload_cooperative_prefetch requires pin_cpu_memory")
+
         # validate dit_offload_prefetch_size
         if self.dit_offload_prefetch_size > 1 and (
             isinstance(self.dit_offload_prefetch_size, float)

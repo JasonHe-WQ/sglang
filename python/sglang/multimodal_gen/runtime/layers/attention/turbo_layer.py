@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.cooperative_prefetch import (
+    cooperative_a2a_gate,
+)
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -70,7 +73,14 @@ def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
         post_all2all_fun = post_all2all(local_seq_2_local_head, seq_world_size)
 
     output = torch.empty_like(input_t)
-    dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
+    with cooperative_a2a_gate():
+        work = dist.all_to_all_single(
+            output, input_t, group=group, async_op=async_op
+        )
+        if async_op:
+            # Returning the postprocessed output already requires completion;
+            # keep cooperative H2D paused until the asynchronous work is done.
+            work.wait()
 
     res = post_all2all_fun(output)
     return res
@@ -133,42 +143,61 @@ def async_a2a_communicate(
     A2A communication for context parallelism. best used in communicate qkv
     Modified from Nvidia Transformer Engine.
     """
-    a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
-    a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
-    a2a_post_fns = [None] * len(a2a_inputs)
-    if local_seq_2_local_head:
-        for i in range(len(a2a_inputs) + 2):
-            if 0 < i < len(a2a_inputs) + 1:
-                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
-                )
-                a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
-            if i > 1:
-                with torch.get_device_module().stream(cp_stream):
-                    a2a_reqs[i - 2].wait()
-                    a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-            if i < len(a2a_inputs):
-                a2a_inputs[i] = rearrange(
-                    a2a_inputs[i], "bs seq_len (w h) d -> w bs seq_len h d", w=cp_size
-                ).contiguous()
-    else:
-        for i in range(len(a2a_inputs) + 2):
-            if 0 < i < len(a2a_inputs) + 1:
-                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
-                )
-                a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
-            if i < len(a2a_inputs):
-                a2a_inputs[i] = rearrange(
-                    a2a_inputs[i], "bs (w s) h d -> w bs s h d", w=cp_size
-                ).contiguous()
-            if i > 1:
-                with torch.get_device_module().stream(cp_stream):
-                    a2a_reqs[i - 2].wait()
-                    a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-    torch.get_device_module().current_stream().wait_stream(cp_stream)
+    with cooperative_a2a_gate():
+        a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
+        a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
+        a2a_post_fns = [None] * len(a2a_inputs)
+        if local_seq_2_local_head:
+            for i in range(len(a2a_inputs) + 2):
+                if 0 < i < len(a2a_inputs) + 1:
+                    a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
+                    a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                        a2a_outputs[i - 1],
+                        a2a_inputs[i - 1],
+                        group=cp_group,
+                        async_op=True,
+                    )
+                    a2a_post_fns[i - 1] = post_all2all(
+                        local_seq_2_local_head, cp_size
+                    )
+                if i > 1:
+                    with torch.get_device_module().stream(cp_stream):
+                        a2a_reqs[i - 2].wait()
+                        a2a_outputs[i - 2] = a2a_post_fns[i - 2](
+                            a2a_outputs[i - 2]
+                        )
+                if i < len(a2a_inputs):
+                    a2a_inputs[i] = rearrange(
+                        a2a_inputs[i],
+                        "bs seq_len (w h) d -> w bs seq_len h d",
+                        w=cp_size,
+                    ).contiguous()
+        else:
+            for i in range(len(a2a_inputs) + 2):
+                if 0 < i < len(a2a_inputs) + 1:
+                    a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
+                    a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                        a2a_outputs[i - 1],
+                        a2a_inputs[i - 1],
+                        group=cp_group,
+                        async_op=True,
+                    )
+                    a2a_post_fns[i - 1] = post_all2all(
+                        local_seq_2_local_head, cp_size
+                    )
+                if i < len(a2a_inputs):
+                    a2a_inputs[i] = rearrange(
+                        a2a_inputs[i],
+                        "bs (w s) h d -> w bs s h d",
+                        w=cp_size,
+                    ).contiguous()
+                if i > 1:
+                    with torch.get_device_module().stream(cp_stream):
+                        a2a_reqs[i - 2].wait()
+                        a2a_outputs[i - 2] = a2a_post_fns[i - 2](
+                            a2a_outputs[i - 2]
+                        )
+        torch.get_device_module().current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 

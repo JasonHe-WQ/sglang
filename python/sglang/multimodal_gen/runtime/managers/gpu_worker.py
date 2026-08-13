@@ -38,6 +38,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.cooperative_prefetch import (
+    shutdown_cooperative_prefetch_schedulers,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
@@ -214,6 +217,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "127.0.0.1", self.master_port
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            sp_nccl_high_priority=self.server_args.sp_nccl_high_priority,
         )
 
         # set proc title
@@ -1042,6 +1046,7 @@ def run_scheduler_process(
         raise
     finally:
         # Clean up resources to speed up shutdown
+        shutdown_cooperative_prefetch_schedulers()
         if "scheduler" in locals():
             del scheduler
         gc.collect()

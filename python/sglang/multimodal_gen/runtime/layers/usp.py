@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.cooperative_prefetch import (
+    cooperative_a2a_gate,
+)
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -43,7 +46,8 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     output = torch.empty_like(x)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    with cooperative_a2a_gate():
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
 
 
@@ -56,13 +60,14 @@ def _usp_all_to_all_single_varlen(
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x = x.flatten().contiguous()
     output = torch.empty(sum(output_split_sizes), dtype=x.dtype, device=x.device)
-    dist.all_to_all_single(
-        output,
-        x,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-        group=ulysses_pg,
-    )
+    with cooperative_a2a_gate():
+        dist.all_to_all_single(
+            output,
+            x,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=ulysses_pg,
+        )
     return output
 
 

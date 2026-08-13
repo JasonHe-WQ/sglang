@@ -317,6 +317,7 @@ def initialize_model_parallel(
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
+    sp_nccl_high_priority: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -330,6 +331,7 @@ def initialize_model_parallel(
         tensor_parallel_degree: number of GPUs used for tensor parallelism.
         pipeline_parallel_degree: number of GPUs used for pipeline parallelism.
         backend: distributed backend of pytorch collective comm.
+        sp_nccl_high_priority: run SP NCCL subgroups on high-priority CUDA streams.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 groups to parallelize the batch dim(dp), 2 groups to parallelize
@@ -446,6 +448,7 @@ def initialize_model_parallel(
             sp_ring_degree=ring_degree,
             rank=get_world_group().rank,
             sp_groups=sp_groups,
+            nccl_high_priority=sp_nccl_high_priority,
         )
         PROCESS_GROUP = _YC_PROCESS_GROUP
 
@@ -520,6 +523,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    sp_nccl_high_priority: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -560,6 +564,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        sp_nccl_high_priority=sp_nccl_high_priority,
     )
 
     # Only set CUDA device if we're on a CUDA platform
